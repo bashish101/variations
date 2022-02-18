@@ -1,7 +1,7 @@
 import numpy as np
 
 def forward_diff(f, hx = 1.0, hy = 1.0, bc = 0):        
-    """ Computes gradient (∇_{+}f) using forward difference approximation
+    """ Computes first derivative using forward difference approximation
     f_x = (f_{i+1, j} - f{i, j}) / h_x
     f_y = (f_{i, j+1} - f{i, j}) / h_y
     (Uses Homogeneous Neumann boundary conditions)
@@ -38,9 +38,9 @@ def forward_diff(f, hx = 1.0, hy = 1.0, bc = 0):
     return fx, fy
 
 def backward_diff(f, hx = 1.0, hy = 1.0, bc = 0):        
-    """ Computes gradient (∇_{-}f) using backward difference approximation
-    f_x = (f_{i+1, j} - f{i-1, j}) / h_x
-    f_y = (f_{i, j+1} - f{i, j-1}) / h_y
+    """ Computes first derivative using backward difference approximation
+    f_x = (f_{i+1, j} - f{i, j}) / h_x
+    f_y = (f_{i, j+1} - f{i, j}) / h_y
     (Uses Homogeneous Neumann boundary conditions)
         Args:
     ----------------
@@ -75,7 +75,7 @@ def backward_diff(f, hx = 1.0, hy = 1.0, bc = 0):
     return fx, fy
     
 def central_diff(f, hx = 1.0, hy = 1.0, bc = 0):        
-    """ Computes gradient (∇_{0}f) using central difference approximation
+    """ Computes first derivative using central difference approximation
     f_x = (f_{i+1, j} - f{i, j}) / (2 * h_x)
     f_y = (f_{i, j+1} - f{i, j}) / (2 * h_y)
     (Uses Homogeneous Neumann boundary conditions)
@@ -119,10 +119,9 @@ def central_diff(f, hx = 1.0, hy = 1.0, bc = 0):
     return fx, fy
 
 def divergence(f, hx = 1.0, hy = 1.0, bc = 0):
-    """ Computes divergence (∇.f) as transposed gradient operation
+    """ Computes first derivative using central difference approximation
     f_x = (f_{i+1, j} - f{i, j}) / (2 * h_x)
     f_y = (f_{i, j+1} - f{i, j}) / (2 * h_y)
-      ∇.f = f_x + f_y
     (Uses Homogeneous Neumann boundary conditions)
         Args:
     ----------------
@@ -156,68 +155,6 @@ def divergence(f, hx = 1.0, hy = 1.0, bc = 0):
     fx = (curr_x - prev_x) / hx
     fy = (curr_y - prev_y) / hy
     return fx + fy
-
-def curl(f, hx = 1.0, hy = 1.0, bc = 0):
-    """ Computes curl (∇×f) in 2d using central-difference approximations
-    f_x = (f_{i+1, j} - f_{i-1, j}) / (2 * h_x)
-    f_y = (f_{i, j+1} - f_{i, j-1}) / (2 * h_y)
-    (Uses Homogeneous Neumann boundary conditions)
-        Args:
-    ----------------
-            f: Input image
-            bc: Boundary condition 
-                0 for Homogeneous Neumann Boundary condition
-                1 for Dirichlet Boundary condition
-        Returns:
-    ----------------
-            div f: Divergence of f
-        This approximation is of consistency order O(h^2)
-    """
-    fx_c, fy_c = central_diff(f, hx, hy, bc)
-    return fx_c - fy_c
-    
-def laplacian(f, hx = 1.0, hy = 1.0, bc = 0):     
-    """ Computes laplacian (Δf) using half-pixel grid-sizes
-    (or alternatively, forward and backward difference combination)
-    f_xx = (f_{i+1, j} - 2 * f{i, j} + f_{i-1, j}) / (h_x^2)
-    f_yy = (f_{i, j+1} - 2 * f{i, j} + f_{i, j-1}) / (h_y^2)
-    Δf = f_xx + f_yy
-    (Uses Homogeneous Neumann boundary conditions)
-        Args:
-    ----------------
-            f: Input image
-            bc: Boundary condition 
-                0 for Homogeneous Neumann Boundary condition
-                1 for Dirichlet Boundary condition
-        Returns:
-    ----------------
-            Delta f: Laplacian of f
-        This approximation is of consistency order O(tau + h_x^2 + h_y^2)
-    """
-    # Shift back/above by 1 to get f_{i+1, j}/f_{i, j+1}
-    next_x = np.roll(f, -1, axis = 1)
-    next_y = np.roll(f, -1, axis = 0)
-    
-    # Shift forward/down by 1 to get f_{i-1, j}/f_{i, j-1}
-    prev_x = np.roll(f, 1, axis = 1)
-    prev_y = np.roll(f, 1, axis = 0)
-    
-    if bc in [0, 'neumann']:
-        # Reflecting boundary conditions
-        next_x[:, -1] =  next_x[:, -2]
-        next_y[-1, :] =  next_y[-2, :]
-        prev_x[:, 0] =  prev_x[:, 1]
-        prev_y[0, :] =  prev_y[1, :]
-    elif bc in [1, 'dirichlet']:
-        # Dirichlet boundary conditions
-        next_x[:, -1] =  0
-        next_y[-1, :] =  0
-        prev_x[:, 0] =  0
-        prev_y[0, :] =  0
-        
-    f_xx = (next_x - 2 * f + prev_x) / (hx ** 2)
-    f_yy = (next_y - 2 * f + prev_y) / (hy ** 2)
-    return f_xx + f_yy
 
 def get_derivatives(f1, f2, hx = 1.0, hy = 1.0, ht = 1.0):
     """ Computes spatial and temporal derivatives for the given frames
@@ -374,4 +311,53 @@ def upsample2d(f, rate):
     f = np.repeat(f, rate, axis = 0)
     f = np.repeat(f, rate, axis = 1)
     return f
-           
+
+import math           
+import torch
+import numbers
+from torch import nn
+from torch.nn import functional as F
+
+class GaussianSmoothing(nn.Module):
+    """
+    Apply gaussian smoothing on a 1d, 2d or 3d tensor
+    https://discuss.pytorch.org/t/is-there-anyway-to-do-gaussian-filtering-for-an-image-2d-3d-in-pytorch/12351/10
+    """
+    def __init__(self, channels, sigma, kernel_size = 3,  dim=2):
+        super(GaussianSmoothing, self).__init__()
+        if isinstance(kernel_size, numbers.Number):
+            kernel_size = [kernel_size] * dim
+        if isinstance(sigma, numbers.Number):
+            sigma = [sigma] * dim
+
+        # The gaussian kernel is the product of the
+        # gaussian function of each dimension.
+        kernel = 1
+        meshgrids = torch.meshgrid([torch.arange(size, dtype=torch.float32) for size in kernel_size])
+        for size, std, mgrid in zip(kernel_size, sigma, meshgrids):
+            mean = (size - 1) / 2
+            kernel *= 1 / (std * (2 * np.pi) ** 0.5) * \
+                      torch.exp(-((mgrid - mean) / std) ** 2 / 2)
+
+        # Make sure sum of values in gaussian kernel equals 1.
+        kernel = kernel / torch.sum(kernel)
+
+        # Reshape to depthwise convolutional weight
+        kernel = kernel.view(1, 1, *kernel.size())
+        kernel = kernel.repeat(channels, *[1] * (kernel.dim() - 1))
+
+        self.register_buffer('weight', kernel)
+        self.groups = channels
+
+        if dim == 1:
+            self.conv = F.conv1d
+        elif dim == 2:
+            self.conv = F.conv2d
+        elif dim == 3:
+            self.conv = F.conv3d
+        else:
+            raise RuntimeError('Only 1, 2 and 3 dimensions are supported. Received {}.'.format(dim))
+
+    def forward(self, input):
+        return self.conv(input, weight=self.weight, groups=self.groups)
+
