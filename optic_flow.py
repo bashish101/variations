@@ -6,15 +6,40 @@ from image_op import *
 from time import time
 from multigrid import full_multigrid
 
-class Solver():
+class OpticFlow():
     def __init__(self,
                  num_cycles = 3, 
-                 depth_per_cycle = 3):
+                 depth_per_cycle = 3,
+                 smooth_iter = 2,
+                 noise_scale = 0.5,
+                 integration_scale = 5,
+                 hx = 1,
+                 hy = 1,
+                 ht = 1,
+                 tau = 0.2,
+                 lambd = 5,
+                 alpha = 500,
+                 base_solver = 'jacobi'):
         self.num_cycles = num_cycles
         self.max_depths = [depth_per_cycle] * self.num_cycles
-        self.base_solver = None
         
- 
+        self.smooth_iter = smooth_iter
+        self.noise_scale = noise_scale
+        self.integration_scale = integration_scale
+        
+        self.hx = hx
+        self.hy = hy
+        self.ht = ht
+        
+        self.tau = tau
+        self.alpha = alpha
+        self.lambd = lambd
+        
+        if base_solver == 'gs':
+            self.base_solver = self.gauss_seidel
+        else:
+            self.base_solver = self.jacobi
+        
     def forward_diff(self, f, hx = 1.0, hy = 1.0, bc = 0):   
         curr_x = curr_y = f
             
@@ -83,7 +108,7 @@ class Solver():
         return fx, fy
 
     
-    def compute_struct_tensor(self, f1, f2, hx = 1.0, hy = 1.0, ht = 1.0, rho = 5, sigma = 0.5):
+    def compute_struct_tensor(self, f1, f2):
         # Compute structure tensor with smoothing in integration scale
         # rho >= 2 * sigma
         
@@ -92,21 +117,21 @@ class Solver():
         f1 = f1.reshape(h, w, -1)                                       # shape = (h, w, ch)
         f2 = f2.reshape(h, w, -1)                                       # shape = (h, w, ch)
         
-        f1 = gaussian_filter(f1, sigma = sigma, multichannel = True)
-        f2 = gaussian_filter(f2, sigma = sigma, multichannel = True)
+        f1 = gaussian_filter(f1, sigma = self.noise_scale, multichannel = True)
+        f2 = gaussian_filter(f2, sigma = self.noise_scale, multichannel = True)
         
-        fx1, fy1 = self.central_diff(f1, hx, hy) 
-        fx2, fy2 = self.central_diff(f2, hx, hy)
+        fx1, fy1 = self.central_diff(f1, self.hx, self.hy) 
+        fx2, fy2 = self.central_diff(f2, self.hx, self.hy)
         fx = (fx1 + fx2) / 2.0
         fy = (fy1 + fy2) / 2.0
-        ft = (f2 - f1) / ht
+        ft = (f2 - f1) / self.ht
         
-        J11 = np.sum(gaussian_filter(fx * fx, sigma = rho, multichannel = True), axis = -1)
-        J12 = np.sum(gaussian_filter(fx * fy, sigma = rho, multichannel = True), axis = -1)
-        J13 = np.sum(gaussian_filter(fx * ft, sigma = rho, multichannel = True), axis = -1)
-        J22 = np.sum(gaussian_filter(fy * fy, sigma = rho, multichannel = True), axis = -1)
-        J23 = np.sum(gaussian_filter(fy * ft, sigma = rho, multichannel = True), axis = -1)
-        J33 = np.sum(gaussian_filter(ft * ft, sigma = rho, multichannel = True), axis = -1)
+        J11 = np.sum(gaussian_filter(fx * fx, sigma = self.integration_scale, multichannel = True), axis = -1)
+        J12 = np.sum(gaussian_filter(fx * fy, sigma = self.integration_scale, multichannel = True), axis = -1)
+        J13 = np.sum(gaussian_filter(fx * ft, sigma = self.integration_scale, multichannel = True), axis = -1)
+        J22 = np.sum(gaussian_filter(fy * fy, sigma = self.integration_scale, multichannel = True), axis = -1)
+        J23 = np.sum(gaussian_filter(fy * ft, sigma = self.integration_scale, multichannel = True), axis = -1)
+        J33 = np.sum(gaussian_filter(ft * ft, sigma = self.integration_scale, multichannel = True), axis = -1)
 
         return (J11, J12, J13, J22, J23)
     
@@ -136,74 +161,8 @@ class Solver():
             g = np.where(grad_sq == 0, g1, g2)
             
         return g
-        
-    def explicit_solver(self, fx, fy, ft, u = None, v = None, alpha = 500., lambd = 1., tau = 0.2, hx = 1.0, hy = 1.0):
-        """ Explicit solver iteration
-            Args:
-        ----------------
-                u: Flow vector in horizontal direction at previous iteration
-                v: Flow vector in vertical direction at previous iteration
-                alpha: Smoothness weight
-                lambd: Lambda value in Charbonnier smoothness term
-                tau: Time step size
-                hx: Pixel size in x direction
-                hy: Pixel size in x direction
-                
-            Returns:
-        ----------------
-                Returns the computed flow vectors:
-                u: Flow vector in horizontal direction at current iteration
-                v: Flow vector in vertical direction at current iteration
-        """
-        # Initialization
-        r, c = fx.shape[:2]
-        if u is None or v is None:
-            u = np.zeros((r, c))
-            v = np.zeros((r, c))
-        
-        ux1, uy1 = forward_diff(u, hx, hy)
-        ux2, uy2 = backward_diff(u, hx, hy)            
-        vx1, vy1 = forward_diff(v, hx, hy)
-        vx2, vy2 = backward_diff(v, hx, hy)
-        
-        if lambd is None:
-            # Create homogeneous smoothness across pixels  
-            g = np.ones_like(u)
-            print('here')
-        else:
-            uv = np.stack([u, v], axis = -1)
-            g = self.get_diffusivities(uv, choice = 'charbonnier', lambd = lambd, hx = hx, hy = hy)
-
-        # Shift back/above by 1 to get g_{i+1, j}/g_{i, j+1}
-        next_gx = np.roll(g, -1, axis = 1)
-        next_gy = np.roll(g, -1, axis = 0)
-        
-        # Shift forward/down by 1 to get g_{i-1, j}/g_{i, j-1}
-        prev_gx = np.roll(g, 1, axis = 1)
-        prev_gy = np.roll(g, 1, axis = 0)
-        
-        # Reflecting boundary conditions
-        next_gx[:, -1] =  next_gy[:, -2]
-        next_gy[-1, :] =  next_gx[-2, :]
-        prev_gx[:, 0] =  prev_gy[:, 1]
-        prev_gy[0, :] =  prev_gx[1, :]
-        
-        half_gx = (next_gx + g) / 2.
-        neg_half_gx = (prev_gx + g) / 2.
-        half_gy = (next_gy + g) / 2.
-        neg_half_gy = (prev_gy + g) / 2.
-        factor = tau / alpha
-        u1 = (u + tau * ((half_gx * ux1 - neg_half_gx * ux2) \
-                         + (half_gy * uy1 - neg_half_gy * uy2)) \
-                - factor * (fx * (fy * v + ft))) / (1 + factor * fx * fx)
-               
-        v1 = (v + tau * ((half_gx * vx1 - neg_half_gy * vx2) \
-                         + (half_gy * vy1 - neg_half_gy * vy2)) \
-                - factor * (fy * (fx * u + ft))) / (1 + factor * fy * fy)
-        
-        return u1, v1
-        
-    def get_residual(self, u, v, J, alpha, h):
+       
+    def get_residual(self, u, v, J, h):
         # Computes residual: 
         # r^h = f^h - A^h x_tilde^h
         # This residual computation is for Laplacian in smoothness term E-L
@@ -213,7 +172,7 @@ class Solver():
         laplace_kernel = np.array([[0, 1, 0],
                                    [1,-4, 1],
                                    [0, 1, 0]])
-        factor = (h * h) / alpha 
+        factor = (h * h) / self.alpha 
                               
         f_true = factor * (J12 * v + J13)
         f_est = conv2d(u, laplace_kernel) + factor * J11 * u
@@ -229,19 +188,19 @@ class Solver():
     
     
     
-    def cycle(self, u, v, J, depth, max_depth, alpha = 500, hx = 1, hy = 1, smoothiter = 2):
+    def cycle(self, u, v, J, depth, max_depth, hx = 1, hy = 1):
         # If scale is coarsest, return time-marching solver solution
         if depth == max_depth:
             # Use time marching solution
-            u1, v1 = self.base_solver(u, v, J, alpha, hx, hy, iterations = smoothiter, parabolic = True)
+            u1, v1 = self.base_solver(u, v, J, hx, hy, iterations = self.smooth_iter, parabolic = True)
             return u1, v1
             
         # Presmoothing
         t1 = time()
-        u1, v1 = self.base_solver(u, v, J, alpha, hx, hy, iterations = smoothiter)
+        u1, v1 = self.base_solver(u, v, J, hx, hy, iterations = self.smooth_iter)
         t2 = time()
         t_diff = t2 - t1
-        print('Pre-smoothing computation: {:.4f}'.format(t_diff))
+        # print('Pre-smoothing computation: {:.4f}'.format(t_diff))
                       
         (J11, J12, J13, J22, J23) = J
         
@@ -249,7 +208,7 @@ class Solver():
         # Compute residual
         assert hx == hy, 'Uneven grid size'
         # get new f_tilde and g_tilde
-        r_u, r_v = self.get_residual(u1, v1, J, alpha, hx)
+        r_u, r_v = self.get_residual(u1, v1, J, hx)
         t2 = time()
         t_diff = t2 - t1
         # print('Residual computation: {:.4f}'.format(t_diff))
@@ -267,7 +226,7 @@ class Solver():
         J_down = (J11_down, J12_down, J13_down, J22_down, J23_down)
         
         # Compute errors
-        e1, e2 = self.cycle(r_u_down, r_v_down, J_down, depth + 1, max_depth, alpha, step * hx, step * hy, smoothiter)
+        e1, e2 = self.cycle(np.zeros_like(r_u_down), np.zeros_like(r_v_down), J_down, depth + 1, max_depth, step * hx, step * hy)
         # base_solver(r_u, r_v, J_down, alpha, hx, hy)
         
         # Upsample
@@ -280,18 +239,18 @@ class Solver():
         
         t2 = time()
         t_diff = t2 - t1
-        print('Scale {0} computation: {1:.4f}'.format(step, t_diff))
+        # print('Scale {0} computation: {1:.4f}'.format(step, t_diff))
             
         # Post-smoothing
         t1 = time()
-        u1, v1 = self.base_solver(u1, v1, J, alpha, hx, hy, iterations = smoothiter)
+        u1, v1 = self.base_solver(u1, v1, J, hx, hy, iterations = self.smooth_iter)
         t2 = time()
         t_diff = t2 - t1
-        print('Post-smoothing computation: {:.4f}'.format(t_diff))
+        # print('Post-smoothing computation: {:.4f}'.format(t_diff))
         
         return u1, v1
     
-    def multi_grid_solver(self, f1, f2, alpha = 500, hx = 1, hy = 1):
+    def multi_grid_solver(self, f1, f2):
         """ Multi-grid solver
             Args:
         ----------------
@@ -309,11 +268,11 @@ class Solver():
         
         
         t1 = time()
-        J = self.compute_struct_tensor(f1, f2, rho = 2.5, sigma = 0.5)
+        J = self.compute_struct_tensor(f1, f2)
         t2 = time()
         t_diff = t2 - t1
         compute_time.append(t_diff)
-        print('Structure tensor computation: {:.4f}'.format(t_diff))
+        # print('Structure tensor computation: {:.4f}'.format(t_diff))
         
         # Initialization
         height, width = f1.shape[:2]
@@ -325,13 +284,15 @@ class Solver():
             # f_tilde, g_tilde = self.compute_f_tilde(f, v)
             
             t1 = time()
-            u1, v1 = self.cycle(u, v, J, depth = 1, max_depth = self.max_depths[idx], alpha = alpha, hx = 1, hy = 1, smoothiter = 2)
+            u, v = self.cycle(u, v, J, depth = 1, max_depth = self.max_depths[idx], hx = 1, hy = 1)
             compute_time.append(time() - t1)
+            mag = np.sqrt(u ** 2 + v ** 2)
+            print('Cycle {}: Max mag: {:.2f} Mean mag: {:.2f}'.format(idx, np.amax(mag), np.mean(mag)))
                  
         print('Total computation time: {:.4f}'.format(sum(compute_time)))
-        return (u1, v1)
+        return (u, v)
         
-    def jacobi(self, u, v, J, alpha = 500, hx = 1, hy = 1, iterations = 2, tau = 0.2, parabolic = False):
+    def jacobi(self, u, v, J,  hx = 1, hy = 1, iterations = 2, parabolic = False):
         """ Jacobi Solver for Non-linear system
             Args:
         ----------------
@@ -355,7 +316,7 @@ class Solver():
                        [1, 0, 1],
                        [0, 1, 0]])
         nb_size = 4 
-        factor = (h * h) / alpha  
+        factor = (h * h) / self.alpha  
             
         for _ in range(iterations):
             sum_nb_u = conv2d(u, nb)
@@ -367,10 +328,10 @@ class Solver():
             denr_v = nb_size + factor * J22
             
             if parabolic:
-                numr_u = u + tau * numr_u
-                denr_u = tau * denr_u + 1
-                numr_v = v + tau * numr_v
-                denr_v = tau * denr_v + 1
+                numr_u = u + self.tau * numr_u
+                denr_u = self.tau * denr_u + 1
+                numr_v = v + self.tau * numr_v
+                denr_v = self.tau * denr_v + 1
                 
             u = numr_u / denr_u
             v = numr_v / denr_v
@@ -379,7 +340,7 @@ class Solver():
         return u, v
 
         
-    def gauss_seidel(self, u, v, J, alpha = 500, hx = 1, hy = 1, iterations = 2, tau = 0.2, parabolic = False):
+    def gauss_seidel(self, u, v, J, hx = 1, hy = 1, iterations = 2, parabolic = False):
         """ Gauss-Seider Solver for Non-linear system
             Args:
         ----------------
@@ -409,26 +370,9 @@ class Solver():
                            [0, 1, 0]], dtype = bool)
         
         
-        # Can use convolution only with Jacobi
-        # since for Gauss-Seidel computations depend on current timestep results
-        
-        # sum_small_u = self.conv2d(u1, small_nb)
-        # sum_big_u = self.conv2d(u, big_nb)
-        # sum_small_v = self.conv2d(v1, small_nb)
-        # sum_big_v = self.conv2d(v, big_nb)
-        # numr_u = sum_small_u + sum_big_u - factor * (J12 * v + J13)
-        # denr_u = nb_size + factor * J11
-        # numr_v  = sum_small_v + sum_big_u - factor * (J12 * v + J23)
-        # denr_v = nb_size + factor * J22
-        # u1 = numr_u / denr_u
-        # v1 = numr_v / denr_v
-        
-        # TODO: Replace smoothness term (change discretization for div of diffusivity)
-        # now it is simple laplacian due to norm of grad square
-        
         # Neighbourhood size (in Laplacian approximation)
         nb_size = 4 
-        factor = (h ** 2) / alpha
+        factor = (h ** 2) / self.alpha
             
         omega = 1     # omega \in (0, 2) # for omega = 1, usual gs
         
@@ -456,10 +400,10 @@ class Solver():
                     denr_v = nb_size + factor * J22[i, j]
                     
                     if parabolic:
-                        numr_u = u[i, j] + tau * numr_u
-                        denr_u = tau * denr_u + 1
-                        numr_v = v[i, j] + tau * numr_v
-                        denr_v = tau * denr_v + 1
+                        numr_u = u[i, j] + self.tau * numr_u
+                        denr_u = self.tau * denr_u + 1
+                        numr_v = v[i, j] + self.tau * numr_v
+                        denr_v = self.tau * denr_v + 1
                 
                     
                     # SOR: Need to tune omega with line search
@@ -476,16 +420,15 @@ class Solver():
         return u, v
         
     
-
-
-class OpticFlow(object):
-    def __init__(self, 
-                 num_cycles = 10, 
-                 depth_per_cycle = 3):
-        self.solver = Solver(num_cycles = num_cycles, depth_per_cycle = depth_per_cycle)
+    def __call__(self, f1, f2):            
+        print('Alpha:', self.alpha)
+        print('Lambda:', self.lambd)
+        print('tau:', self.tau)
         
-    def __call__(self):
-        return self.compute_flow()
+        u, v = self.multi_grid_solver(f1, f2)
+        
+        vis = self.visualize(u, v)
+        return vis
 
     def visualize(self, u, v):
         """ Computes RGB image visualizing the flow vectors """
@@ -546,54 +489,42 @@ class OpticFlow(object):
         flow_img = np.stack([r, g, b], axis = -1).astype(np.uint8)
         
         return flow_img
-        
-    def compute_flow(self, f1, f2, alpha = 500, lambd = 1, tau = 0.2, maxiter = 1000, solver = 'explicit', base_solver = 'jacobi'):
-        r, c = f1.shape[:2]
-        
-        u = v = np.zeros((r, c))
-        
-        if base_solver == 'jacobi':
-            self.solver.base_solver = self.solver.jacobi
-        else:
-            self.solver.base_solver = self.solver.gauss_seidel
-            
-        print('Alpha:', alpha)
-        print('Lambda:', lambd)
-        print('tau:', tau)
-        
-        if solver == 'explicit':
-            fx, fy, ft = get_derivatives(f1, f2)
-            for it in range(maxiter):
-                u, v = self.solver.explicit_solver(fx, fy, ft, u, v, alpha = alpha, lambd = lambd)
-                mag = np.sqrt(u ** 2 + v ** 2)
-                print('{}: Max mag: {:.2f} Mean mag: {:.2f}'.format(it, np.amax(mag), np.mean(mag)))
-        else:
-            u, v = self.solver.multi_grid_solver(f1, f2, alpha = alpha)
-        
-        
-        vis = self.visualize(u, v)
-        return vis
+
+
         
     
 def main():
-    kmax = 200              # Number of iterations (we are interested in steady state of the diffusion-reaction system)
-    alpha = 500             # Regularization Parameter (should be large enough to weight smoothness terms which have small magnitude)
+    smooth_iter = 3         # Number of iterations (we are interested in steady state of the diffusion-reaction system)
+    alpha = 50              # Regularization Parameter (should be large enough to weight smoothness terms which have small magnitude)
     tau = 0.2               # Step size (For implicit scheme, can choose arbitrarily large, for explicit scheme  <=0.25)
-    lambd = 0.1
-    solver = 'multi_grid'
+    lambd = 5               # Contrast parameter used in diffusivity
+    solver = 'multigrid'
     base_solver = 'jacobi'
+    noise_scale = 0.5
+    integration_scale = 2
+    
+    
     # frame1_path = input('Enter first image: ')
     # frame2_path = input('Enter second image: ')
-    frame1_path = 'a.pgm'
-    frame2_path = 'b.pgm'
-    frame1 = Image.open(frame1_path)
-    frame2 = Image.open(frame2_path)
+    frame1_path = 'test/1.png'
+    frame2_path = 'test/2.png'
+    frame1 = Image.open(frame1_path) #.resize((456, 256))
+    frame2 = Image.open(frame2_path) #.resize((456, 256))
     
     f1 = np.array(frame1, dtype = np.float)
     f2 = np.array(frame2, dtype = np.float)
     
-    optic_flow = OpticFlow(num_cycles = 3, depth_per_cycle = 3)
-    vis = optic_flow.compute_flow(f1, f2, alpha = alpha, lambd = lambd, tau = tau, maxiter = kmax, solver = solver, base_solver = base_solver)
+    optic_flow = OpticFlow(num_cycles = 3, 
+                           depth_per_cycle = 4,
+                           noise_scale = noise_scale,
+                           integration_scale = integration_scale,
+                           alpha = alpha, 
+                           lambd = lambd, 
+                           tau = tau, 
+                           smooth_iter = smooth_iter,
+                           base_solver = base_solver)
+                          
+    vis = optic_flow(f1, f2)
     vis = Image.fromarray(vis)
     vis.save('./visual.pgm')
     vis.show()
