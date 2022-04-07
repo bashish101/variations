@@ -12,22 +12,95 @@ import torch.nn.functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class Solver(nn.Module):
+class OpticFlow(nn.Module):
     def __init__(self,
-                 num_cycles = 3):
+                 num_cycles = 3, 
+                 depth_per_cycle = 3,
+                 smooth_iter = 2,
+                 noise_scale = 0.5,
+                 integration_scale = 2,
+                 hx = 1,
+                 hy = 1,
+                 ht = 1,
+                 tau = 0.2,
+                 lambd = 5,
+                 alpha = 500,
+                 base_solver = 'jacobi'):
+        super(OpticFlow, self).__init__()
+        
+        self.num_cycles = num_cycles
+        self.max_depths = [depth_per_cycle] * self.num_cycles
+        
+        self.smooth_iter = smooth_iter
+        self.noise_scale = noise_scale
+        self.integration_scale = integration_scale
+        
+        self.hx = hx
+        self.hy = hy
+        self.ht = ht
+        
+        self.tau = tau
+        self.alpha = alpha
+        self.lambd = lambd
+        
+        if base_solver == 'gs':
+            self.base_solver = self.gauss_seidel
+        else:
+            self.base_solver = self.jacobi
+                 
         self.num_cycles = num_cycles
         self.max_depths = [3] * self.num_cycles
         jacobi_kernel = torch.tensor([[0., 1., 0.],
-                                     [1., 0., 1.],
-                                     [0., 1., 0.]])
-        self.jacobi_kernel = jacobi_kernel.view(1, 1, 3, 3)
+                                      [1., 0., 1.],
+                                      [0., 1., 0.]], dtype = torch.double)
+        self.jacobi_kernel = jacobi_kernel.view(1, 1, 3, 3).to(device)
         
         
         laplace_kernel = torch.tensor([[0., 1., 0.],
                                        [1., -4, 1.],
-                                       [0., 1., 0.]])
-        self.laplace_kernel = laplace_kernel.view(1, 1, 3, 3)
-        self.base_solver = None
+                                       [0., 1., 0.]], dtype = torch.double)
+        self.laplace_kernel = laplace_kernel.view(1, 1, 3, 3).to(device)
+        
+        self.inner_filter = GaussianConv2D(sigma = noise_scale, dim = 2, channels = 3)
+        self.outer_filter =  GaussianConv2D(sigma = integration_scale, dim = 2, channels = 3 * 6)
+
+    def forward_diff(self, f, hx = 1.0, hy = 1.0, bc = 0):        
+        # Shift back/above by 1 to get f_{i+1, j}/f_{i, j+1}
+        next_x = torch.roll(f, -1, dims = -1)
+        next_y = torch.roll(f, -1, dims = -2)
+
+        # Reflecting boundary conditions
+        if bc in [0, 'neumann']:
+            # Reflecting boundary conditions
+            next_x[..., -1] =  next_x[..., -2]
+            next_y[:, :, -1, :] =  next_y[:, :, -2, :]
+        elif bc in [1, 'dirichlet']:
+            # Dirichlet boundary conditions
+            next_x[..., -1] =  0
+            next_y[:, :, -1, :] =  0
+
+        fx = (next_x - f) / hx
+        fy = (next_y - f) / hy
+        return fx, fy
+
+    def backward_diff(self, f, hx = 1.0, hy = 1.0, bc = 0):        
+        # Shift forward/down by 1 to get f_{i-1, j}/f_{i, j-1}
+        prev_x = torch.roll(f, 1, dims = -1)
+        prev_y = torch.roll(f, 1, dims = -2)
+
+        # Reflecting boundary conditions
+        if bc in [0, 'neumann']:
+            # Reflecting boundary conditions
+            prev_x[..., 0] =  prev_x[..., 1]
+            prev_y[:, :, 0, :] =  prev_y[:, :, 1, :]
+        elif bc in [1, 'dirichlet']:
+            # Dirichlet boundary conditions
+            prev_x[..., 0] =  0
+            prev_y[:, :, 0, :] =  0
+
+        fx = (f - prev_x) / hx
+        fy = (f - prev_y) / hy
+        return fx, fy
         
     def central_diff(self, f, hx = 1.0, hy = 1.0, bc = 0):        
         # Shift back/above by 1 to get f_{i+1, j}/f_{i, j+1}
@@ -57,21 +130,19 @@ class Solver(nn.Module):
         return fx, fy
     
     def compute_gradient(self, f1, f2):
-        fx1, fy1 = self.central_diff(f1)   
-        fx2, fy2 = self.central_diff(f2)   
+        fx1, fy1 = self.central_diff(f1, hx = self.hx, hy = self.hy)   
+        fx2, fy2 = self.central_diff(f2, hx = self.hx, hy = self.hy)   
         
         nabla_fx = (fx1 + fx2) / 2.0
-        nabla_fx = (fy1 + fy2) / 2.0
-        nabla_ft = (f2 - f1) / ht
+        nabla_fy = (fy1 + fy2) / 2.0
+        nabla_ft = (f2 - f1) / self.ht
         return nabla_fx, nabla_fy, nabla_ft
     
-    def compute_struct_tensor(self, f1, f2, hx = 1.0, hy = 1.0, ht = 1.0, rho = 5, sigma = 0.5):
+    def compute_struct_tensor(self, f1, f2):
         bs, ch, h, w = f1.shape
-        inner_filter = GaussianSmoothing(sigma = sigma, dim = 2)
-        outer_filter =  GaussianSmoothing(sigma = rho, dim = 2)
         
-        f1 = inner_filter(f1)
-        f2 = inner_filter(f2)
+        f1 = self.inner_filter(f1)
+        f2 = self.inner_filter(f2)
         
         nabla_fx, nabla_fy, nabla_ft = self.compute_gradient(f1, f2)
         
@@ -83,110 +154,53 @@ class Solver(nn.Module):
         t33 = nabla_ft * nabla_ft
         
         J = torch.stack([t11, t12, t13, t22, t23, t33], dim = 1).view(bs, -1, h, w) # shape: bs, 6, 3, h, w
-        J = outer_filter(J)
+
+        J = self.outer_filter(J)
         J = J.view(bs, 6, ch, h, w).sum(dim = 2)                                    # shape: bs, 6, h, w
         
         return (J[:, 0], J[:, 1], J[:, 2], J[:, 3], J[:, 4])
         
-    
-    def compute_struct_tensor_old(self, f1, f2, hx = 1.0, hy = 1.0, ht = 1.0, rho = 5, sigma = 0.5):
-        # Compute structure tensor with smoothing in integration scale
-        # rho >= 2 * sigma
-        
-        h, w = f1.shape[-2:]
-        # f1 = f1.reshape(h, w, -1)                                       # shape = (h, w, ch)
-        # f2 = f2.reshape(h, w, -1)                                       # shape = (h, w, ch)
-        
-        f1 = np.stack([gaussian_filter(im.permute(1, 2, 0).numpy(), sigma = sigma, multichannel=True) for im in f1], dim = 0) # shape = (bs, h, w, ch)
-        f1 = torch.from_numpy(f1).permute(0, 3, 1, 2) # shape = (bs, ch, h, w)
-        fx1, fy1 = self.central_diff(f1)   
-        
-        f2 = np.stack([gaussian_filter(im.permute(1, 2, 0).numpy(), sigma = sigma, multichannel=True) for im in f2], dim = 0)
-        f2 = torch.from_numpy(f2).permute(0, 3, 1, 2)
-        fx2, fy2 = self.central_diff(f2)   
-        
-        nabla_fx = (fx1 + fx2) / 2.0
-        nabla_fx = (fy1 + fy2) / 2.0
-        nabla_ft = (f2 - f1) / ht
-        
-        t11 = nabla_fx * nabla_fx
-        t12 = nabla_fx * nabla_fy
-        t13 = nabla_fx * nabla_ft
-        t22 = nabla_fy * nabla_fy
-        t23 = nabla_fy * nabla_ft
-        t33 = nabla_ft * nabla_ft
-        
-        # apply Gaussian filter separately to each (h, w, ch) image and add across channels
-        J11 = torch.tensor([np.sum(gaussian_filter(im.permute(1, 2, 0).numpy(), sigma = rho, multichannel=True), axis = -1) for im in t11])  
-        J12 = torch.tensor([np.sum(gaussian_filter(im.permute(1, 2, 0).numpy(), sigma = rho, multichannel=True), axis = -1)  for im in t12])
-        J13 = torch.tensor([np.sum(gaussian_filter(im.permute(1, 2, 0).numpy(), sigma = rho, multichannel=True), axis = -1)  for im in t13])
-        J22 = torch.tensor([np.sum(gaussian_filter(im.permute(1, 2, 0).numpy(), sigma = rho, multichannel=True), axis = -1) for im in t22])
-        J23 = torch.tensor([np.sum(gaussian_filter(im.permute(1, 2, 0).numpy(), sigma = rho, multichannel=True), axis = -1)  for im in t23])
-        J33 = torch.tensor([np.sum(gaussian_filter(im.permute(1, 2, 0).numpy(), sigma = rho, multichannel=True), axis = -1)  for im in t33])
-
-        return (J11, J12, J13, J22, J23)
-    
-    def get_diffusivities(self, u, choice = 'charbonnier', lambd = 3., hx = 1., hy = 1.):
-        # Isotropic non-linear diffiusivities
-        dim = len(u.shape)
-        ux, uy = self.central_diff(u, hx, hy)
-        grad_sq = ux ** 2 + uy ** 2
-        
-        if dim == 3:
-            # Couple the diffusivity computation across channels
-            grad_sq = np.sum(grad_sq, axis = -1)
-            
-        if lambd == 0:
-            return np.ones_like(grad_sq)
-      
-        ratio = (grad_sq) / (lambd ** 2)
-        if choice in ['charbonnier', 0]:
-            g = 1 / np.sqrt(1 + ratio)
-        elif choice in ['perona-malik', 1]:
-            g = 1 / (1 + ratio)
-        elif choice in ['perona-malik', 2]:
-            g = np.exp(-0.5 * ratio)
-        else:
-            g1 = 1
-            g2 = 1. - np.exp(-3.31488 / (ratio ** 4))
-            g = np.where(grad_sq == 0, g1, g2)
-            
-        return g
-        
-    def get_residual(self, u, v, J, alpha, h):
+    def get_residual(self, u, v, J, hx, hy):
         # Computes residual: 
         # r^h = f^h - A^h x_tilde^h
         # This residual computation is for Laplacian in smoothness term E-L
         
         (J11, J12, J13, J22, J23) = J
         
-        factor = (h * h) / alpha 
+        # assume hx = hy
+        assert hx == hy, 'Uneven grid size'
+        
+        factor = 1 / self.alpha 
                               
-        f = factor * (J12 * v + J13)
-        A_u = F.conv2d(u, self.laplace_kernel) + factor * J11 * u
+        b_1 = factor * (J12 * v + J13)
         
-        res_u = f - A_u
+        sum_nb_u, sum_nb_v, center_wt = self.compute_diffusion_term(u, v, hx, hy)
+        A_u = sum_nb_u - center_wt * u + factor * J11 * u
+        # A_u = F.conv2d(u, self.laplace_kernel, padding = 'same') + factor * J11 * u
         
-        g = factor * (J12 * u + J23)
-        A_v = F.conv2d(v, self.laplace_kernel) + factor * J22 * v
+        res_u = b_1 - A_u
         
-        res_v = g - A_v
+        b_2 = factor * (J12 * u + J23)
+        A_v = sum_nb_v - center_wt * v + factor * J22 * v
+        #A_v = F.conv2d(v, self.laplace_kernel, padding = 'same') + factor * J22 * v
+        
+        res_v = b_2 - A_v
         
         return res_u, res_v
     
-    def cycle(self, u, v, J, depth, max_depth, alpha = 500, hx = 1, hy = 1, smoothiter = 2):
+    def cycle(self, u, v, J, depth, max_depth, hx = 1, hy = 1):
         # If scale is coarsest apply time-marching, stop
         if depth == max_depth:
             # Use time marching solution
-            u1, v1 = self.base_solver(u, v, J, alpha, hx, hy, iterations = smoothiter, parabolic = True)
+            u1, v1 = self.base_solver(u, v, J, hx, hy, iterations = self.smooth_iter, parabolic = True)
             return u1, v1
             
         # Presmoothing
         t1 = time()
-        u1, v1 = self.base_solver(u, v, J, alpha, hx, hy, iterations = smoothiter)
+        u1, v1 = self.base_solver(u, v, J, hx, hy, iterations = self.smooth_iter)
         t2 = time()
         t_diff = t2 - t1
-        print('Pre-smoothing computation: {:.4f}'.format(t_diff))
+        # print('Pre-smoothing computation: {:.4f}'.format(t_diff))
                       
         (J11, J12, J13, J22, J23) = J
         
@@ -194,7 +208,7 @@ class Solver(nn.Module):
         # Compute residual
         assert hx == hy, 'Uneven grid size'
         # get new f_tilde and g_tilde
-        r_u, r_v = self.get_residual(u1, v1, J, alpha, hx)
+        r_u, r_v = self.get_residual(u1, v1, J, hx, hy)
         t2 = time()
         t_diff = t2 - t1
         # print('Residual computation: {:.4f}'.format(t_diff))
@@ -213,7 +227,9 @@ class Solver(nn.Module):
         J_down = (J11_down, J12_down, J13_down, J22_down, J23_down)
         
         # Compute errors
-        e1, e2 = self.cycle(r_u_down, r_v_down, J_down, depth + 1, max_depth, alpha, 2 * hx, 2 * hy, smoothiter)
+        e1 = torch.zeros_like(r_u_down, device = device)
+        e2 = torch.zeros_like(r_v_down, device = device)
+        e1, e2 = self.cycle(e1, e2, J_down, depth + 1, max_depth, 2 * hx, 2 * hy)
         # base_solver(r_u, r_v, J_down, alpha, hx, hy)
         
         # Upsample
@@ -226,18 +242,18 @@ class Solver(nn.Module):
         
         t2 = time()
         t_diff = t2 - t1
-        print('Scale {0} computation: {1:.4f}'.format(step, t_diff))
+        # print('Scale {0} computation: {1:.4f}'.format(step, t_diff))
             
         # Post-smoothing
         t1 = time()
-        u1, v1 = self.base_solver(u1, v1, J, alpha, hx, hy, iterations = smoothiter)
+        u1, v1 = self.base_solver(u1, v1, J, hx, hy, self.smooth_iter)
         t2 = time()
         t_diff = t2 - t1
-        print('Post-smoothing computation: {:.4f}'.format(t_diff))
+        # print('Post-smoothing computation: {:.4f}'.format(t_diff))
         
         return u1, v1
     
-    def multi_grid_solver(self, f1, f2, alpha = 500, hx = 1, hy = 1):
+    def multi_grid_solver(self, f1, f2):
         """ Multi-grid solver
             Args:
         ----------------
@@ -255,30 +271,116 @@ class Solver(nn.Module):
         
         
         t1 = time()
-        J = self.compute_struct_tensor(f1, f2, rho = 5)
+        J = self.compute_struct_tensor(f1, f2)
         t2 = time()
         t_diff = t2 - t1
         compute_time.append(t_diff)
-        print('Structure tensor computation: {:.4f}'.format(t_diff))
+        print('Structure tensor computation time: {:.4f}'.format(t_diff))
         
         # Initialization
-        height, width = f1.shape[:2]
-        u = np.zeros((height, width))
-        v = np.zeros((height, width))
+        bs, ch, height, width = f1.shape
+        u = torch.zeros((bs, 1, height, width), device = device).double()
+        v = torch.zeros((bs, 1, height, width), device = device).double()
         
-        self.max_depths = [3] * self.num_cycles
+        #self.max_depths = [self.depth_per_cycle] * self.num_cycles
         for idx in range(self.num_cycles):
             # Solve using f_tilde instead of f in a cycle, for accuracy use multiple correcting multigrid cycles
             # f_tilde, g_tilde = self.compute_f_tilde(f, v)
             
             t1 = time()
-            u1, v1 = self.cycle(u, v, J, depth = 1, max_depth = self.max_depths[idx], alpha = 500, hx = 1, hy = 1, smoothiter = 2)
+            u, v = self.cycle(u, v, J, depth = 1, max_depth = self.max_depths[idx], hx = self.hx, hy = self.hy)
             compute_time.append(time() - t1)
+            
+            mag = torch.sqrt(u ** 2 + v ** 2).detach().cpu().numpy()
+            print('Cycle {}: Max mag: {:.2f} Mean mag: {:.2f}'.format(idx, np.amax(mag), np.mean(mag)))
+            # print('Cycle {} computation time: {:.4f}'.format(idx, time() - t1))
                  
         print('Total computation time: {:.4f}'.format(sum(compute_time)))
-        return (u1, v1)
+        return (u, v)
+
+    def get_diffusivities(self, u, choice = 'charbonnier', hx = 1., hy = 1.):
+        # Isotropic non-linear diffiusivities
+        dim = len(u.shape)
+        ux, uy = self.central_diff(u, hx, hy)
+        grad_sq = ux ** 2 + uy ** 2
+
+        # Couple the diffusivity computation across channels
+        grad_sq = torch.sum(grad_sq, dim = 1, keepdim = True)
+            
+        ones = torch.ones_like(grad_sq, device = device)
+        if self.lambd == 0:
+            return ones
+      
+        ratio = (grad_sq) / (self.lambd ** 2)
+        if choice in ['charbonnier', 0]:
+            g = 1 / torch.sqrt(1 + ratio)
+        elif choice in ['perona-malik', 1]:
+            g = 1 / (1 + ratio)
+        elif choice in ['perona-malik', 2]:
+            g = torch.exp(-0.5 * ratio)
+        else:
+            g1 = ones
+            g2 = 1. - torch.exp(-3.31488 / (ratio ** 4))
+            g = torch.where(grad_sq == 0, g1, g2)
+            
+        return g
+    
+    
+    def get_shifted(self, g):
+        # Shift back/above by 1 to get g_{i+1, j}/g_{i, j+1}
+        next_gx = torch.roll(g, -1, dims = -1)
+        next_gy = torch.roll(g, -1, dims = -2)
         
-    def jacobi(self, u, v, J, alpha = 500, hx = 1, hy = 1, iterations = 2, tau = 0.2, parabolic = False):
+        # Shift forward/down by 1 to get g_{i-1, j}/g_{i, j-1}
+        prev_gx = torch.roll(g, 1, dims = -1)
+        prev_gy = torch.roll(g, 1, dims = -2)
+        
+        # Reflecting boundary conditions
+        next_gx[..., -1] =  next_gx[..., -2]
+        next_gy[:, :, -1, :] =  next_gy[:, :, -2, :]
+        prev_gx[..., 0] =  prev_gx[..., 1]
+        prev_gy[:, :, 0, :] =  prev_gy[:, :, 1, :]
+    
+        return next_gx, next_gy, prev_gx, prev_gy
+    
+    def compute_diffusion_term(self, u, v, hx = 1, hy = 1, homogeneous = False):
+        if homogeneous or self.lambd == 0:
+            sum_nb_u = F.conv2d(u, self.jacobi_kernel, padding = 'same')
+            sum_nb_v = F.conv2d(v, self.jacobi_kernel, padding = 'same')
+            return sum_nb_u, sum_nb_v, 4
+            
+        ux1, uy1 = self.forward_diff(u, hx, hy)
+        ux2, uy2 = self.backward_diff(u, hx, hy)            
+        vx1, vy1 = self.forward_diff(v, hx, hy)
+        vx2, vy2 = self.backward_diff(v, hx, hy)
+        
+        uv = torch.cat([u, v], dim = 1)
+        g = self.get_diffusivities(uv, choice = 'perona-malik', hx = hx, hy = hy)
+        
+        next_gx, next_gy, prev_gx, prev_gy = self.get_shifted(g)
+        next_ux, next_uy, prev_ux, prev_uy = self.get_shifted(u)
+        next_vx, next_vy, prev_vx, prev_vy = self.get_shifted(v)
+        
+        next_half_gx = (next_gx + g) / 2.
+        prev_half_gx = (prev_gx + g) / 2.
+        next_half_gy = (next_gy + g) / 2.
+        prev_half_gy = (prev_gy + g) / 2.
+        
+        factor = 1.0 / (hx * hx)
+        sum_nb_u = factor * ((next_half_gx * next_ux - prev_half_gx * prev_ux) \
+                  + (next_half_gy * next_uy - prev_half_gy * prev_uy))
+        sum_nb_v = factor * ((next_half_gx * next_vx - prev_half_gx * prev_vx) \
+                  + (next_half_gy * next_vy - prev_half_gy * prev_vy))
+        center_wt = factor * (next_half_gx + prev_half_gx + next_half_gy + prev_half_gy)
+        
+        # sum_nb_u = (1 / h) * ((next_half_gx * ux1 - prev_half_gx * ux2) \
+        #          + (next_half_gy * uy1 - prev_half_gy * uy2))
+        # sum_nb_v = (1 / h) * ((next_half_gx * vx1 - prev_half_gx * vx2) \
+        #          + (next_half_gy * vy1 - prev_half_gy * vy2))
+                  
+        return sum_nb_u, sum_nb_v, center_wt
+        
+    def jacobi(self, u, v, J, hx = 1, hy = 1, iterations = 2, tau = 0.2, parabolic = False):
         """ Jacobi Solver for Non-linear system
             Args:
         ----------------
@@ -298,25 +400,19 @@ class Solver(nn.Module):
         h = hx
         (J11, J12, J13, J22, J23) = J
 
-        nb = np.array([[0, 1, 0],
-                       [1, 0, 1],
-                       [0, 1, 0]])
-        nb_size = 4 
-        factor = (h * h) / alpha  
+        factor = 1 / self.alpha  
         
         for _ in range(iterations):
-            sum_nb_u = F.conv2d(u, self.jacobi_kernel)
-            sum_nb_v = F.conv2d(v, self.jacobi_kernel)
-            
+            sum_nb_u, sum_nb_v, center_wt = self.compute_diffusion_term(u, v, hx, hy)
             numr_u = sum_nb_u - factor * (J12 * v + J13)
-            denr_u = nb_size + factor * J11
+            denr_u = center_wt + factor * J11
             numr_v  = sum_nb_v - factor * (J12 * u + J23)
-            denr_v = nb_size + factor * J22
+            denr_v = center_wt + factor * J22
             
             if parabolic:
-                numr_u = u + tau * numr_u
+                numr_u = u + self.tau * numr_u
                 denr_u = tau * denr_u + 1
-                numr_v = v + tau * numr_v
+                numr_v = v + self.tau * numr_v
                 denr_v = tau * denr_v + 1
                 
             u = numr_u / denr_u
@@ -324,16 +420,15 @@ class Solver(nn.Module):
         
 
         return u, v
-
         
-    def gauss_seidel(self, u, v, J, alpha = 500, hx = 1, hy = 1, iterations = 2, tau = 0.2, parabolic = False):
-        """ Gauss-Seider Solver for Non-linear system
+    def homogeneous_jacobi(self, u, v, J, hx = 1, hy = 1, iterations = 2, tau = 0.2, parabolic = False):
+        """ Jacobi Solver for Non-linear system
             Args:
         ----------------
                 u: Previous flow field components in horizontal direction
                 v: Previous flow field components in vertical direction
                 J: Motion tensor
-                alpha: Smoothness parameter
+                alpha: Smoothness paramteer
                 hx, hy: Grid size
                 
             Returns:
@@ -342,95 +437,33 @@ class Solver(nn.Module):
                 u1: Flow fields in horizontal direction
                 v1: Flow fields in vertical direction
         """
-        # Check if causes problem on downsampling
         assert hx == hy, 'Uneven grid size'
-        h = hx 
+        h = hx
         (J11, J12, J13, J22, J23) = J
-        
-        nrows, ncols = u.shape[:2]
-        small_nb = np.array([[0, 1, 0],
-                             [1, 0, 0],
-                             [0, 0, 0]], dtype = bool)
-        big_nb = np.array([[0, 0, 0],
-                           [0, 0, 1],
-                           [0, 1, 0]], dtype = bool)
-        
-        
-        # Can use convolution only with Jacobi
-        # since for Gauss-Seidel computations depend on current timestep results
-        
-        # sum_small_u = self.conv2d(u1, small_nb)
-        # sum_big_u = self.conv2d(u, big_nb)
-        # sum_small_v = self.conv2d(v1, small_nb)
-        # sum_big_v = self.conv2d(v, big_nb)
-        # numr_u = sum_small_u + sum_big_u - factor * (J12 * v + J13)
-        # denr_u = nb_size + factor * J11
-        # numr_v  = sum_small_v + sum_big_u - factor * (J12 * v + J23)
-        # denr_v = nb_size + factor * J22
-        # u1 = numr_u / denr_u
-        # v1 = numr_v / denr_v
-        
-        # TODO: Replace smoothness term (change discretization for div of diffusivity)
-        # now it is simple laplacian due to norm of grad square
-        
-        # Neighbourhood size (in Laplacian approximation)
+
         nb_size = 4 
-        factor = (h ** 2) / alpha
-            
-        omega = 1     # omega \in (0, 2) # for omega = 1, usual gs
+        factor = (h * h) / self.alpha  
         
-        for _ in range(iterations):     
-            # Reflecting bc
-            u1 = np.copy(u)       
-            v1 = np.copy(v)
-            u1_prime = np.zeros_like(u)       
-            v1_prime = np.zeros_like(u)
-            u1 = np.pad(u1, 1, mode = 'symmetric')
-            v1 = np.pad(v1, 1, mode = 'symmetric')
-            u = np.pad(u, 1, mode = 'symmetric')
-            v = np.pad(v, 1, mode = 'symmetric')     
-                 
-            for i in range(1, nrows):
-                for j in range(1, ncols):
-                    sum_small_u = np.sum((u1[i-1:i+2, j-1:j+2])[small_nb])
-                    sum_small_v = np.sum((v1[i-1:i+2, j-1:j+2])[small_nb])
-                    sum_big_u =  np.sum((u[i-1:i+2, j-1:j+2])[big_nb])
-                    sum_big_v =  np.sum((v[i-1:i+2, j-1:j+2])[big_nb])
-                    
-                    numr_u = sum_small_u + sum_big_u - factor * (J12[i, j] * v[i, j] + J13[i, j])
-                    denr_u = nb_size + factor * J11[i, j]
-                    numr_v  = sum_small_v + sum_big_u - factor * (J12[i, j] * u[i, j] + J23[i, j])
-                    denr_v = nb_size + factor * J22[i, j]
-                    
-                    if parabolic:
-                        numr_u = u[i, j] + tau * numr_u
-                        denr_u = tau * denr_u + 1
-                        numr_v = v[i, j] + tau * numr_v
-                        denr_v = tau * denr_v + 1
+        for _ in range(iterations):
+            sum_nb_u = F.conv2d(u, self.jacobi_kernel, padding = 'same')
+            sum_nb_v = F.conv2d(v, self.jacobi_kernel, padding = 'same')
+            
+            numr_u = sum_nb_u - factor * (J12 * v + J13)
+            denr_u = nb_size + factor * J11
+            numr_v  = sum_nb_v - factor * (J12 * u + J23)
+            denr_v = nb_size + factor * J22
+            
+            if parabolic:
+                numr_u = u + self.tau * numr_u
+                denr_u = tau * denr_u + 1
+                numr_v = v + self.tau * numr_v
+                denr_v = tau * denr_v + 1
                 
-                    
-                    # SOR: Need to tune omega with line search
-                    # May be use omega matrix, since blocks of evolving structures have interacting omegas
-                    u1_prime[i, j] = numr_u / denr_u
-                    v1_prime[i, j] = numr_v / denr_v
-                    u1[i, j] = u1[i, j] + omega * (u1_prime[i, j] - u1[i, j])
-                    v1[i, j] = v1[i, j] + omega * (v1_prime[i, j] - v1[i, j])
-                    
-            # Remove dummy boundaries
-            u = u1[1:-1, 1:-1]
-            v = v1[1:-1, 1:-1]
-            
+            u = numr_u / denr_u
+            v = numr_v / denr_v
+        
+
         return u, v
-        
-    
-
-
-class OpticFlow(object):
-    def __init__(self):
-        self.solver = Solver()
-        
-    def __call__(self):
-        return self.compute_flow()
 
     def visualize(self, u, v):
         """ Computes RGB image visualizing the flow vectors """
@@ -492,55 +525,70 @@ class OpticFlow(object):
         
         return flow_img
         
-    def compute_flow(self, f1, f2, alpha = 500, lambd = 4, tau = 0.2, maxiter = 1000, solver = 'explicit', base_solver = 'jacobi'):
-        bs, ch, h, w = f1.shape[-2:]
+    def forward(self, f1, f2):            
+        print('Alpha:', self.alpha)
+        print('Lambda:', self.lambd)
+        print('tau:', self.tau)
         
-        u = v = torch.zeros((bs, h, w), device = device)
+        u, v = self.multi_grid_solver(f1, f2)
         
-        if base_solver == 'jacobi':
-            self.solver.base_solver = self.solver.jacobi
-        else:
-            self.solver.base_solver = self.solver.gauss_seidel
-            
-        print('Alpha:', alpha)
-        print('Lambda:', lambd)
-        print('tau:', tau)
-        
-        u, v = self.solver.multi_grid_solver(f1, f2, alpha = alpha)
-        
-        
-        vis = self.visualize(u, v)
-        return vis
+        return u, v
         
     
 def main():
-    kmax = 1500              # Number of iterations (we are interested in steady state of the diffusion-reaction system)
-    alpha = 500             # Regularization Parameter (should be large enough to weight smoothness terms which have small magnitude)
+    smooth_iter = 3         # Number of iterations (we are interested in steady state of the diffusion-reaction system)
+    alpha = 500              # Regularization Parameter (should be large enough to weight smoothness terms which have small magnitude)
     tau = 0.2               # Step size (For implicit scheme, can choose arbitrarily large, for explicit scheme  <=0.25)
-    lambd = 4
-    solver = 'multi_grid'
+    lambd = 0               # Contrast parameter used in diffusivity
+    solver = 'multigrid'
     base_solver = 'jacobi'
+    noise_scale = 0.5
+    integration_scale = 1.5
+    num_cycles = 4
+    depth_per_cycle = 4
+    
+    
     # frame1_path = input('Enter first image: ')
     # frame2_path = input('Enter second image: ')
-    frame1_path = 'a.pgm'
-    frame2_path = 'b.pgm'
-    frame1 = Image.open(frame1_path)
-    frame2 = Image.open(frame2_path)
+    frame1_path = 'test/1.png'
+    frame2_path = 'test/4.png'
+    frame1 = Image.open(frame1_path).convert('RGB')
+    frame2 = Image.open(frame2_path).convert('RGB')
     
     f1 = np.array(frame1, dtype = np.float)
-    f1 = np.ascontiguousarray(f1[None].transpose(0, 3, 1, 2))
-    f1 = torch.tensor(f1, device = device)
+    if len(f1.shape) == 2:
+        f1 = f1[..., None]
+    f1 = np.ascontiguousarray(f1.transpose(2, 0, 1))
+    f1 = torch.tensor([f1], device = device)
     
     f2 = np.array(frame2, dtype = np.float)
-    f1 = np.ascontiguousarray(f2[None].transpose(0, 3, 1, 2))
-    f2 = torch.tensor(f2, device = device)
+    if len(f2.shape) == 2:
+        f2 = f2[..., None]
+    f2 = np.ascontiguousarray(f2.transpose(2, 0, 1))
+    f2 = torch.tensor([f2], device = device)
     
-    optic_flow = OpticFlow()
-    vis = optic_flow.compute_flow(f1, f2, alpha = alpha, lambd = lambd, tau = tau, maxiter = kmax, solver = solver, base_solver = base_solver)
+    optic_flow = OpticFlow(num_cycles = num_cycles, 
+                           depth_per_cycle = depth_per_cycle,
+                           noise_scale = noise_scale,
+                           integration_scale = integration_scale,
+                           alpha = alpha, 
+                           lambd = lambd, 
+                           tau = tau, 
+                           smooth_iter = smooth_iter,
+                           base_solver = base_solver)
+    optic_flow.to(device)
+    
+    # for _ in range(3):                      
+    u, v = optic_flow(f1, f2)
+    
+    u = u.detach().cpu().squeeze().numpy()
+    v = v.detach().cpu().squeeze().numpy()
+    
+    vis = optic_flow.visualize(u, v)
+    
     vis = Image.fromarray(vis)
     vis.save('./visual.pgm')
     vis.show()
 
 if __name__ == '__main__':
-    main()    
-    
+    main() 

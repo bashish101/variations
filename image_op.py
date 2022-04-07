@@ -300,17 +300,48 @@ def conv2d(f, kernel):
 
     return f_conv 
 
-def downsample2d(f, rate):
-    if rate == 1:
-        return f
-    return f[::rate, ::rate]
+def downsample2d(v, rate = 2, mode = 'mean'):
+    '''Performs 2D downsampling operation''' 
+    h, w = v.shape[:2]
+    if h % rate != 0:
+        pad_length = rate - h % rate
+        v = np.pad(v, [(0, pad_length), (0, 0)], mode = 'symmetric')
+        h += pad_length
+    if w % rate != 0:
+        pad_length = rate - w % rate
+        v = np.pad(v, [(0, 0), (0, pad_length)], mode = 'symmetric')
+        w += pad_length
+    rsize_h, rsize_w = int(h / rate), int(w / rate)
+    v = v.reshape(rsize_h, rate, rsize_w, rate)
+    if mode == 'mean':
+        return v.mean(axis = (1, 3))
+    elif mode == 'max':
+        return v.max(axis = (1, 3))
+    else:
+        return v[::rate, ::rate]
+        
+def upsample2d(v, rate = 2, mode = 'bilinear'):
+    '''Performs 2D bilinear upsampling operation''' 
+    if mode != 'bilinear':
+        v = np.repeat(v, rate, axis = 0)
+        v = np.repeat(v, rate, axis = 1)
+        return v
+        
+    h, w = v.shape[:2]
+    v_up = np.zeros((h * 2, w * 2))
+    v_pad = np.pad(v, [(1,), (1,)], mode = 'symmetric')  
     
-def upsample2d(f, rate):
-    if rate == 1:
-        return f
-    f = np.repeat(f, rate, axis = 0)
-    f = np.repeat(f, rate, axis = 1)
-    return f
+    w1 = 9. / 16
+    w2 = 3. / 16
+    w3 = 3. / 16
+    w4 = 1. / 16
+    
+    v_up[1::2, 1::2] = w1 * v_pad[1:-1, 1:-1] + w2 * v_pad[2:, 1:-1] + w3 * v_pad[1:-1, 2:] + w4 * v_pad[2:, 2:]
+    v_up[1::2, 0::2] = w1 * v_pad[1:-1, 1:-1] + w2 * v_pad[2:, 1:-1] + w3 * v_pad[1:-1, :-2] + w4 * v_pad[2:, :-2]
+    v_up[0::2, 1::2] = w1 * v_pad[1:-1, 1:-1] + w2 * v_pad[:-2, 1:-1] + w3 * v_pad[1:-1, 2:] + w4 * v_pad[:-2, 2:]
+    v_up[0::2, 0::2] = w1 * v_pad[1:-1, 1:-1] + w2 * v_pad[:-2, 1:-1] + w3 * v_pad[1:-1, :-2] + w4 * v_pad[:-2, :-2]
+    
+    return v_up
 
 import math           
 import torch
@@ -318,13 +349,18 @@ import numbers
 from torch import nn
 from torch.nn import functional as F
 
-class GaussianSmoothing(nn.Module):
+
+class GaussianConv2D(nn.Module):
     """
-    Apply gaussian smoothing on a 1d, 2d or 3d tensor
+    Apply gaussian smoothing on a spatial 1d, 2d or 3d tensor
     https://discuss.pytorch.org/t/is-there-anyway-to-do-gaussian-filtering-for-an-image-2d-3d-in-pytorch/12351/10
     """
-    def __init__(self, channels, sigma, kernel_size = 3,  dim=2):
-        super(GaussianSmoothing, self).__init__()
+    def __init__(self, sigma, channels = 3, kernel_size = None,  dim=2):
+        super(GaussianConv2D, self).__init__()
+        if kernel_size  is None:
+            kernel_size = int(4 * sigma + 1)
+            pad_size = int(2 * sigma)
+            
         if isinstance(kernel_size, numbers.Number):
             kernel_size = [kernel_size] * dim
         if isinstance(sigma, numbers.Number):
@@ -333,7 +369,7 @@ class GaussianSmoothing(nn.Module):
         # The gaussian kernel is the product of the
         # gaussian function of each dimension.
         kernel = 1
-        meshgrids = torch.meshgrid([torch.arange(size, dtype=torch.float32) for size in kernel_size])
+        meshgrids = torch.meshgrid([torch.arange(size, dtype=torch.double) for size in kernel_size])
         for size, std, mgrid in zip(kernel_size, sigma, meshgrids):
             mean = (size - 1) / 2
             kernel *= 1 / (std * (2 * np.pi) ** 0.5) * \
@@ -357,7 +393,38 @@ class GaussianSmoothing(nn.Module):
             self.conv = F.conv3d
         else:
             raise RuntimeError('Only 1, 2 and 3 dimensions are supported. Received {}.'.format(dim))
+            
+        padding_size = kernel_size[0] // 2
+        self.pad = NeumannPad2d(size = padding_size)
 
     def forward(self, input):
-        return self.conv(input, weight=self.weight, groups=self.groups)
+        return self.conv(self.pad(input), weight=self.weight, groups=self.groups)
+
+
+class NeumannPad2d(nn.Module):
+    def __init__(self, size = 1):
+        super(NeumannPad2d, self).__init__()
+        self.size = size
+
+    def forward(self, f):
+        # Apply Neumann boundary conditions
+        ndim = len(f.shape)
+        
+        if self.size == 1:
+            f = nn.ReplicationPad2d(1)(f)
+        else:
+            h, w = f.shape[2], f.shape[3] 
+            f = F.pad(f, (self.size, self.size, self.size, self.size), mode = 'constant')
+            neg_ind_start = np.arange(self.size - 1, -1, -1)
+            pos_ind_start = np.arange(self.size, self.size * 2)
+            
+            neg_ind_end_h = h + neg_ind_start
+            pos_ind_end_h = h + pos_ind_start
+            neg_ind_end_w = w + neg_ind_start
+            pos_ind_end_w = w + pos_ind_start
+            f[:, :, neg_ind_start, :] = f[:, :, pos_ind_start, :]
+            f[:, :, :, neg_ind_start] = f[:, :, :, pos_ind_start]
+            f[:, :, pos_ind_end_h, :] = f[:, :, neg_ind_end_h, :]
+            f[:, :, :, pos_ind_end_w] = f[:, :, :, neg_ind_end_w]
+        return f
 
