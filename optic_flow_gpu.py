@@ -158,9 +158,15 @@ class OpticFlow(nn.Module):
         J = self.outer_filter(J)
         J = J.view(bs, 6, ch, h, w).sum(dim = 2)                                    # shape: bs, 6, h, w
         
-        return (J[:, 0], J[:, 1], J[:, 2], J[:, 3], J[:, 4])
+        joint_nabla_fx = torch.sum(nabla_fx * nabla_fx, dim = 1) ** 0.5
+        joint_nabla_fy = torch.sum(nabla_fy * nabla_fy, dim = 1) ** 0.5
+        nabla_f = torch.stack([joint_nabla_fx, joint_nabla_fy], dim = 1)
         
-    def get_residual(self, u, v, J, hx, hy):
+        g = self.get_diffusivities(nabla_f)
+        
+        return (J[:, 0], J[:, 1], J[:, 2], J[:, 3], J[:, 4]), g
+        
+    def get_residual(self, u, v, J, g, hx, hy):
         # Computes residual: 
         # r^h = f^h - A^h x_tilde^h
         # This residual computation is for Laplacian in smoothness term E-L
@@ -174,7 +180,7 @@ class OpticFlow(nn.Module):
                               
         b_1 = factor * (J12 * v + J13)
         
-        sum_nb_u, sum_nb_v, center_wt = self.compute_diffusion_term(u, v, hx, hy)
+        sum_nb_u, sum_nb_v, center_wt = self.compute_diffusion_term(u, v, g, hx, hy)
         A_u = sum_nb_u - center_wt * u + factor * J11 * u
         # A_u = F.conv2d(u, self.laplace_kernel, padding = 'same') + factor * J11 * u
         
@@ -188,16 +194,16 @@ class OpticFlow(nn.Module):
         
         return res_u, res_v
     
-    def cycle(self, u, v, J, depth, max_depth, hx = 1, hy = 1):
+    def cycle(self, u, v, J, g, depth, max_depth, hx = 1, hy = 1):
         # If scale is coarsest apply time-marching, stop
         if depth == max_depth:
             # Use time marching solution
-            u1, v1 = self.base_solver(u, v, J, hx, hy, iterations = self.smooth_iter, parabolic = True)
+            u1, v1 = self.base_solver(u, v, J, g, hx, hy, iterations = self.smooth_iter, parabolic = True)
             return u1, v1
             
         # Presmoothing
         t1 = time()
-        u1, v1 = self.base_solver(u, v, J, hx, hy, iterations = self.smooth_iter)
+        u1, v1 = self.base_solver(u, v, J, g, hx, hy, iterations = self.smooth_iter)
         t2 = time()
         t_diff = t2 - t1
         # print('Pre-smoothing computation: {:.4f}'.format(t_diff))
@@ -208,7 +214,7 @@ class OpticFlow(nn.Module):
         # Compute residual
         assert hx == hy, 'Uneven grid size'
         # get new f_tilde and g_tilde
-        r_u, r_v = self.get_residual(u1, v1, J, hx, hy)
+        r_u, r_v = self.get_residual(u1, v1, J, g, hx, hy)
         t2 = time()
         t_diff = t2 - t1
         # print('Residual computation: {:.4f}'.format(t_diff))
@@ -225,11 +231,12 @@ class OpticFlow(nn.Module):
         J22_down = F.avg_pool2d(J22, step)
         J23_down = r_v_down
         J_down = (J11_down, J12_down, J13_down, J22_down, J23_down)
+        g_down = F.avg_pool2d(g, step)
         
         # Compute errors
         e1 = torch.zeros_like(r_u_down, device = device)
         e2 = torch.zeros_like(r_v_down, device = device)
-        e1, e2 = self.cycle(e1, e2, J_down, depth + 1, max_depth, 2 * hx, 2 * hy)
+        e1, e2 = self.cycle(e1, e2, J_down, g_down, depth + 1, max_depth, 2 * hx, 2 * hy)
         # base_solver(r_u, r_v, J_down, alpha, hx, hy)
         
         # Upsample
@@ -246,7 +253,7 @@ class OpticFlow(nn.Module):
             
         # Post-smoothing
         t1 = time()
-        u1, v1 = self.base_solver(u1, v1, J, hx, hy, self.smooth_iter)
+        u1, v1 = self.base_solver(u1, v1, J, g, hx, hy, self.smooth_iter)
         t2 = time()
         t_diff = t2 - t1
         # print('Post-smoothing computation: {:.4f}'.format(t_diff))
@@ -271,7 +278,7 @@ class OpticFlow(nn.Module):
         
         
         t1 = time()
-        J = self.compute_struct_tensor(f1, f2)
+        J, g = self.compute_struct_tensor(f1, f2)
         t2 = time()
         t_diff = t2 - t1
         compute_time.append(t_diff)
@@ -288,7 +295,7 @@ class OpticFlow(nn.Module):
             # f_tilde, g_tilde = self.compute_f_tilde(f, v)
             
             t1 = time()
-            u, v = self.cycle(u, v, J, depth = 1, max_depth = self.max_depths[idx], hx = self.hx, hy = self.hy)
+            u, v = self.cycle(u, v, J, g, depth = 1, max_depth = self.max_depths[idx], hx = self.hx, hy = self.hy)
             compute_time.append(time() - t1)
             
             mag = torch.sqrt(u ** 2 + v ** 2).detach().cpu().numpy()
@@ -298,18 +305,21 @@ class OpticFlow(nn.Module):
         print('Total computation time: {:.4f}'.format(sum(compute_time)))
         return (u, v)
 
-    def get_diffusivities(self, u, choice = 'charbonnier', hx = 1., hy = 1.):
+    def get_diffusivities(self, nabla_f, choice = 'charbonnier', hx = 1., hy = 1.):
+        ones = torch.ones((nabla_f.shape[0], 1, nabla_f.shape[2], nabla_f.shape[3]), device = device)
+        # Homogenous diffiusivities
+        if self.lambd == 0:
+            return ones
+            
         # Isotropic non-linear diffiusivities
-        dim = len(u.shape)
-        ux, uy = self.central_diff(u, hx, hy)
-        grad_sq = ux ** 2 + uy ** 2
+        dim = len(nabla_f.shape)
+        # ux, uy = self.central_diff(u, hx, hy)
+        # ux ** 2 + uy ** 2
+        grad_sq = nabla_f ** 2 
 
         # Couple the diffusivity computation across channels
         grad_sq = torch.sum(grad_sq, dim = 1, keepdim = True)
             
-        ones = torch.ones_like(grad_sq, device = device)
-        if self.lambd == 0:
-            return ones
       
         ratio = (grad_sq) / (self.lambd ** 2)
         if choice in ['charbonnier', 0]:
@@ -326,28 +336,29 @@ class OpticFlow(nn.Module):
         return g
     
     
-    def get_shifted(self, g):
+    def get_shifted(self, f):
         # Shift back/above by 1 to get g_{i+1, j}/g_{i, j+1}
-        next_gx = torch.roll(g, -1, dims = -1)
-        next_gy = torch.roll(g, -1, dims = -2)
+        next_fx = torch.roll(f, -1, dims = -1)
+        next_fy = torch.roll(f, -1, dims = -2)
         
         # Shift forward/down by 1 to get g_{i-1, j}/g_{i, j-1}
-        prev_gx = torch.roll(g, 1, dims = -1)
-        prev_gy = torch.roll(g, 1, dims = -2)
+        prev_fx = torch.roll(f, 1, dims = -1)
+        prev_fy = torch.roll(f, 1, dims = -2)
         
         # Reflecting boundary conditions
-        next_gx[..., -1] =  next_gx[..., -2]
-        next_gy[:, :, -1, :] =  next_gy[:, :, -2, :]
-        prev_gx[..., 0] =  prev_gx[..., 1]
-        prev_gy[:, :, 0, :] =  prev_gy[:, :, 1, :]
+        next_fx[..., -1] =  next_fx[..., -2]
+        next_fy[:, :, -1, :] =  next_fy[:, :, -2, :]
+        prev_fx[..., 0] =  prev_fx[..., 1]
+        prev_fy[:, :, 0, :] =  prev_fy[:, :, 1, :]
     
-        return next_gx, next_gy, prev_gx, prev_gy
+        return next_fx, next_fy, prev_fx, prev_fy
     
-    def compute_diffusion_term(self, u, v, hx = 1, hy = 1, homogeneous = False):
+    def compute_diffusion_term(self, u, v, g, hx = 1, hy = 1, homogeneous = False):
+        factor = 1.0 / (hx * hx)
         if homogeneous or self.lambd == 0:
             sum_nb_u = F.conv2d(u, self.jacobi_kernel, padding = 'same')
             sum_nb_v = F.conv2d(v, self.jacobi_kernel, padding = 'same')
-            return sum_nb_u, sum_nb_v, 4
+            return factor * sum_nb_u, factor * sum_nb_v, factor * 4
             
         ux1, uy1 = self.forward_diff(u, hx, hy)
         ux2, uy2 = self.backward_diff(u, hx, hy)            
@@ -355,7 +366,7 @@ class OpticFlow(nn.Module):
         vx2, vy2 = self.backward_diff(v, hx, hy)
         
         uv = torch.cat([u, v], dim = 1)
-        g = self.get_diffusivities(uv, choice = 'perona-malik', hx = hx, hy = hy)
+        # g = self.get_diffusivities(uv, choice = 'perona-malik', hx = hx, hy = hy)
         
         next_gx, next_gy, prev_gx, prev_gy = self.get_shifted(g)
         next_ux, next_uy, prev_ux, prev_uy = self.get_shifted(u)
@@ -366,11 +377,10 @@ class OpticFlow(nn.Module):
         next_half_gy = (next_gy + g) / 2.
         prev_half_gy = (prev_gy + g) / 2.
         
-        factor = 1.0 / (hx * hx)
-        sum_nb_u = factor * ((next_half_gx * next_ux - prev_half_gx * prev_ux) \
-                  + (next_half_gy * next_uy - prev_half_gy * prev_uy))
-        sum_nb_v = factor * ((next_half_gx * next_vx - prev_half_gx * prev_vx) \
-                  + (next_half_gy * next_vy - prev_half_gy * prev_vy))
+        sum_nb_u = factor * ((next_half_gx * next_ux + prev_half_gx * prev_ux) \
+                  + (next_half_gy * next_uy + prev_half_gy * prev_uy))
+        sum_nb_v = factor * ((next_half_gx * next_vx + prev_half_gx * prev_vx) \
+                  + (next_half_gy * next_vy + prev_half_gy * prev_vy))
         center_wt = factor * (next_half_gx + prev_half_gx + next_half_gy + prev_half_gy)
         
         # sum_nb_u = (1 / h) * ((next_half_gx * ux1 - prev_half_gx * ux2) \
@@ -380,7 +390,7 @@ class OpticFlow(nn.Module):
                   
         return sum_nb_u, sum_nb_v, center_wt
         
-    def jacobi(self, u, v, J, hx = 1, hy = 1, iterations = 2, tau = 0.2, parabolic = False):
+    def jacobi(self, u, v, J, g, hx = 1, hy = 1, iterations = 2, tau = 0.2, parabolic = False):
         """ Jacobi Solver for Non-linear system
             Args:
         ----------------
@@ -403,7 +413,7 @@ class OpticFlow(nn.Module):
         factor = 1 / self.alpha  
         
         for _ in range(iterations):
-            sum_nb_u, sum_nb_v, center_wt = self.compute_diffusion_term(u, v, hx, hy)
+            sum_nb_u, sum_nb_v, center_wt = self.compute_diffusion_term(u, v, g, hx, hy)
             numr_u = sum_nb_u - factor * (J12 * v + J13)
             denr_u = center_wt + factor * J11
             numr_v  = sum_nb_v - factor * (J12 * u + J23)
@@ -522,6 +532,9 @@ class OpticFlow(nn.Module):
         b = np.minimum(np.maximum(b * mag, 0.0), 255.)
         
         flow_img = np.stack([r, g, b], axis = -1).astype(np.uint8)
+        # max_val = np.amax(flow_img)
+        # flow_img = 255 * flow_img / max_val 
+        # flow_img = flow_img.astype(np.uint8)
         
         return flow_img
         
@@ -537,23 +550,23 @@ class OpticFlow(nn.Module):
     
 def main():
     smooth_iter = 3         # Number of iterations (we are interested in steady state of the diffusion-reaction system)
-    alpha = 500              # Regularization Parameter (should be large enough to weight smoothness terms which have small magnitude)
+    alpha = 100              # Regularization Parameter (should be large enough to weight smoothness terms which have small magnitude)
     tau = 0.2               # Step size (For implicit scheme, can choose arbitrarily large, for explicit scheme  <=0.25)
-    lambd = 0               # Contrast parameter used in diffusivity
+    lambd = 4               # Contrast parameter used in diffusivity
     solver = 'multigrid'
     base_solver = 'jacobi'
     noise_scale = 0.5
-    integration_scale = 1.5
+    integration_scale = 3
     num_cycles = 4
-    depth_per_cycle = 4
+    depth_per_cycle = 3
     
     
     # frame1_path = input('Enter first image: ')
     # frame2_path = input('Enter second image: ')
     frame1_path = 'test/1.png'
-    frame2_path = 'test/4.png'
-    frame1 = Image.open(frame1_path).convert('RGB')
-    frame2 = Image.open(frame2_path).convert('RGB')
+    frame2_path = 'test/2.png'
+    frame1 = Image.open(frame1_path).convert('RGB').resize((456, 256))
+    frame2 = Image.open(frame2_path).convert('RGB').resize((456, 256))
     
     f1 = np.array(frame1, dtype = np.float)
     if len(f1.shape) == 2:
