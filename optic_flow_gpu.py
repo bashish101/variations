@@ -222,13 +222,13 @@ class OpticFlow(nn.Module):
         # Constant interpolation to keep diffusion tensor and motion tensor positive semidefinite
         # Downsample
         step = 2
-        r_u_down = F.avg_pool2d(r_u, step)
-        r_v_down = F.avg_pool2d(r_v, step)
+        r_u_down = F.max_pool2d(r_u, step)
+        r_v_down = F.max_pool2d(r_v, step)
         
-        J11_down = F.avg_pool2d(J11, step)
-        J12_down = F.avg_pool2d(J12, step)
+        J11_down = F.max_pool2d(J11, step)
+        J12_down = F.max_pool2d(J12, step)
         J13_down = r_u_down
-        J22_down = F.avg_pool2d(J22, step)
+        J22_down = F.max_pool2d(J22, step)
         J23_down = r_v_down
         J_down = (J11_down, J12_down, J13_down, J22_down, J23_down)
         g_down = F.avg_pool2d(g, step)
@@ -563,6 +563,8 @@ def main():
     
     # frame1_path = input('Enter first image: ')
     # frame2_path = input('Enter second image: ')
+    frame1_path = 'a.pgm'
+    frame2_path = 'b.pgm'
     frame1_path = 'test/1.png'
     frame2_path = 'test/2.png'
     frame1 = Image.open(frame1_path).convert('RGB').resize((456, 256))
